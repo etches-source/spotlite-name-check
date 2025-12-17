@@ -3,83 +3,123 @@ import { chromium } from "playwright";
 
 const URL = "https://www.spotlite.co.kr/jiujitsu/313/participations/";
 
-function normalize(s) {
+function norm(s) {
   return (s || "").trim().replace(/\s+/g, " ");
+}
+
+// Canonical form for matching: remove spaces + middle dot + hyphen
+function canon(s) {
+  return norm(s).replace(/[ \t·\-]/g, "");
 }
 
 const inputNames = fs
   .readFileSync("names.txt", "utf8")
   .split("\n")
-  .map(normalize)
+  .map(norm)
   .filter(Boolean);
 
-const inputSet = new Set(inputNames);
+const inputCanonToOriginals = new Map(); // canon -> [originals]
+for (const n of inputNames) {
+  const c = canon(n);
+  if (!inputCanonToOriginals.has(c)) inputCanonToOriginals.set(c, []);
+  inputCanonToOriginals.get(c).push(n);
+}
 
-// Extract any Korean-name-looking strings from arbitrary JSON
-function extractKoreanNamesFromJson(obj, outSet) {
-  const nameLike = /^[가-힣]{2,4}$/; // tweak if needed
-  const stack = [obj];
+const found = new Set(); // store canonical names found
 
-  while (stack.length) {
-    const cur = stack.pop();
-    if (!cur) continue;
+// Key filters to reduce false positives
+function isPlayerNameKey(key) {
+  const k = (key || "").toString().toLowerCase();
+  // positive signals
+  const good =
+    k.includes("player") ||
+    k.includes("athlete") ||
+    k.includes("competitor") ||
+    k.includes("participant") ||
+    k.includes("선수") ||
+    k.includes("참가자");
 
-    if (typeof cur === "string") {
-      const s = normalize(cur);
-      if (nameLike.test(s)) outSet.add(s);
-      continue;
+  // negative signals (coach/instructor)
+  const bad =
+    k.includes("coach") ||
+    k.includes("instructor") ||
+    k.includes("지도자") ||
+    k.includes("코치");
+
+  return good && !bad;
+}
+
+function walk(obj, parentKey = "") {
+  if (obj == null) return;
+
+  if (typeof obj === "string") {
+    // Only accept string matches when parentKey looks like a player-name field
+    if (isPlayerNameKey(parentKey)) {
+      const c = canon(obj);
+      if (inputCanonToOriginals.has(c)) found.add(c);
     }
+    return;
+  }
 
-    if (Array.isArray(cur)) {
-      for (const v of cur) stack.push(v);
-      continue;
-    }
+  if (Array.isArray(obj)) {
+    for (const v of obj) walk(v, parentKey);
+    return;
+  }
 
-    if (typeof cur === "object") {
-      for (const k of Object.keys(cur)) stack.push(cur[k]);
+  if (typeof obj === "object") {
+    for (const [k, v] of Object.entries(obj)) {
+      walk(v, k);
     }
   }
 }
 
-const foundNames = new Set();
-
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage();
 
-// IMPORTANT: do NOT use networkidle on SPAs like this
 page.on("response", async (res) => {
   try {
+    // Some sites label JSON as text/plain; try parsing anyway for likely API URLs
+    const url = res.url();
     const ct = (res.headers()["content-type"] || "").toLowerCase();
-    if (!ct.includes("application/json")) return;
+    const looksJson = ct.includes("json") || url.includes("/api") || url.includes("particip") || url.includes("list");
 
-    const json = await res.json();
-    extractKoreanNamesFromJson(json, foundNames);
+    if (!looksJson) return;
+
+    const text = await res.text();
+    if (!text || text.length < 2) return;
+
+    // Try JSON parse
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      return;
+    }
+
+    walk(json, "");
   } catch {
-    // ignore non-JSON / parse errors
+    // ignore
   }
 });
 
 await page.goto(URL, { waitUntil: "domcontentloaded" });
-
-// give the app time to fetch initial data
 await page.waitForTimeout(5000);
 
-// scroll a few times in case it lazy-loads more participants
-for (let i = 0; i < 8; i++) {
-  await page.mouse.wheel(0, 2000);
+// Scroll a bit to trigger lazy loading if any
+for (let i = 0; i < 10; i++) {
+  await page.mouse.wheel(0, 2500);
   await page.waitForTimeout(1200);
 }
 
 await browser.close();
 
-// Now compare
+// Write results (using original input order)
 const lines = ["name,found"];
-for (const name of inputNames) {
-  lines.push(`${name},${foundNames.has(name) ? "YES" : "NO"}`);
+for (const n of inputNames) {
+  const yes = found.has(canon(n)) ? "YES" : "NO";
+  lines.push(`${n},${yes}`);
 }
-
 fs.writeFileSync("results.csv", lines.join("\n"), "utf8");
 
-// Helpful debug output in the Actions log
-console.log(`Collected candidate names from JSON: ${foundNames.size}`);
 console.log(`Input names: ${inputNames.length}`);
+console.log(`Matched (canonical) names found: ${found.size}`);
