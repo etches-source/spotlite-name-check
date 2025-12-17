@@ -1,64 +1,69 @@
 import fs from "node:fs";
+import { chromium } from "playwright";
 
-const API_URL = "https://www.spotlite.co.kr/jiujitsu/313/api/participation_list/";
-const REFERER = "https://www.spotlite.co.kr/jiujitsu/313/participations/";
+const PAGE_URL = "https://www.spotlite.co.kr/jiujitsu/313/participations/";
+const API_PATH = "/jiujitsu/313/api/participation_list/";
 
-function norm(s) {
-  return (s || "").trim().replace(/\s+/g, ""); // remove all whitespace
+function canon(s) {
+  return (s || "").trim().replace(/\s+/g, "");
 }
 
 const rawLines = fs.readFileSync("names.txt", "utf8").split("\n");
-const inputCanon = rawLines.map(norm).filter(Boolean);
-const inputSet = new Set(inputCanon);
+const input = rawLines.map(canon).filter(Boolean);
+const inputSet = new Set(input);
 
-// Fetch all pages (supports DRF-style {results, next})
-async function fetchAll(url) {
-  const all = [];
-  let next = url;
+const browser = await chromium.launch({ headless: true });
+const page = await browser.newPage();
 
-  while (next) {
-    const res = await fetch(next, {
-      headers: {
-        "Accept": "application/json, text/plain, */*",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": REFERER,
-        "User-Agent": "Mozilla/5.0"
-      }
-    });
+let apiText = null;
 
-    const text = await res.text();
+// Listen for the exact API response the page uses
+page.on("response", async (res) => {
+  try {
+    const url = res.url();
+    if (!url.includes(API_PATH)) return;
+    // Grab raw text (works even if server labels it text/html)
+    apiText = await res.text();
+  } catch {}
+});
 
-    // Try JSON parse; if it isn't JSON, print a snippet and fail clearly
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch (e) {
-      console.log("Non-JSON response snippet (first 300 chars):");
-      console.log(text.slice(0, 300));
-      throw new Error(`API did not return JSON (status ${res.status}).`);
-    }
+await page.goto(PAGE_URL, { waitUntil: "domcontentloaded" });
 
-    if (Array.isArray(data)) {
-      all.push(...data);
-      next = null;
-    } else {
-      if (Array.isArray(data.results)) all.push(...data.results);
-      next = data.next || null;
-    }
-  }
-
-  return all;
+// If the page triggers the API call a bit later, give it time
+for (let i = 0; i < 20 && !apiText; i++) {
+  await page.waitForTimeout(500);
 }
 
-// Walk each record and only collect strings that match your input names
-function collectMatchesFromRecord(rec, matches) {
-  const stack = [rec];
+await browser.close();
+
+if (!apiText) {
+  throw new Error("Did not capture participation_list API response. Site may be blocking automation.");
+}
+
+// Parse JSON (and fail loudly with a snippet if it isn't JSON)
+let data;
+try {
+  data = JSON.parse(apiText);
+} catch (e) {
+  console.log("Captured API response (first 400 chars):");
+  console.log(apiText.slice(0, 400));
+  throw new Error("Captured participation_list response was not JSON.");
+}
+
+// Handle either array or paginated {results: [...]}
+const records = Array.isArray(data) ? data : (data.results || []);
+
+const matches = new Set();
+
+// Walk records and only accept strings that match your input list (prevents false positives)
+function walk(obj) {
+  const stack = [obj];
   while (stack.length) {
     const cur = stack.pop();
     if (cur == null) continue;
 
     if (typeof cur === "string") {
-      const c = norm(cur);
+      const c = canon(cur);
       if (inputSet.has(c)) matches.add(c);
       continue;
     }
@@ -72,18 +77,14 @@ function collectMatchesFromRecord(rec, matches) {
   }
 }
 
-const records = await fetchAll(API_URL);
+for (const r of records) walk(r);
 
-const matches = new Set();
-for (const r of records) collectMatchesFromRecord(r, matches);
+console.log(`Records seen: ${records.length}`);
+console.log(`Matched names: ${matches.size}`);
 
-console.log(`API records fetched: ${records.length}`);
-console.log(`Matched names found: ${matches.size}`);
-
-// Output CSV preserving your original formatting per line
 const out = ["name,found"];
 for (const line of rawLines) {
-  const c = norm(line);
+  const c = canon(line);
   if (!c) continue;
   out.push(`${line.trim()},${matches.has(c) ? "YES" : "NO"}`);
 }
