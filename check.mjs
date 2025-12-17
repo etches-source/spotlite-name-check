@@ -1,125 +1,90 @@
 import fs from "node:fs";
-import { chromium } from "playwright";
 
-const URL = "https://www.spotlite.co.kr/jiujitsu/313/participations/";
+const API_URL = "https://www.spotlite.co.kr/jiujitsu/313/api/participation_list/";
+const REFERER = "https://www.spotlite.co.kr/jiujitsu/313/participations/";
 
 function norm(s) {
-  return (s || "").trim().replace(/\s+/g, " ");
+  return (s || "").trim().replace(/\s+/g, ""); // remove all whitespace
 }
 
-// Canonical form for matching: remove spaces + middle dot + hyphen
-function canon(s) {
-  return norm(s).replace(/[ \t·\-]/g, "");
-}
+const rawLines = fs.readFileSync("names.txt", "utf8").split("\n");
+const inputCanon = rawLines.map(norm).filter(Boolean);
+const inputSet = new Set(inputCanon);
 
-const inputNames = fs
-  .readFileSync("names.txt", "utf8")
-  .split("\n")
-  .map(norm)
-  .filter(Boolean);
+// Fetch all pages (supports DRF-style {results, next})
+async function fetchAll(url) {
+  const all = [];
+  let next = url;
 
-const inputCanonToOriginals = new Map(); // canon -> [originals]
-for (const n of inputNames) {
-  const c = canon(n);
-  if (!inputCanonToOriginals.has(c)) inputCanonToOriginals.set(c, []);
-  inputCanonToOriginals.get(c).push(n);
-}
-
-const found = new Set(); // store canonical names found
-
-// Key filters to reduce false positives
-function isPlayerNameKey(key) {
-  const k = (key || "").toString().toLowerCase();
-  // positive signals
-  const good =
-    k.includes("player") ||
-    k.includes("athlete") ||
-    k.includes("competitor") ||
-    k.includes("participant") ||
-    k.includes("선수") ||
-    k.includes("참가자");
-
-  // negative signals (coach/instructor)
-  const bad =
-    k.includes("coach") ||
-    k.includes("instructor") ||
-    k.includes("지도자") ||
-    k.includes("코치");
-
-  return good && !bad;
-}
-
-function walk(obj, parentKey = "") {
-  if (obj == null) return;
-
-  if (typeof obj === "string") {
-    // Only accept string matches when parentKey looks like a player-name field
-    if (isPlayerNameKey(parentKey)) {
-      const c = canon(obj);
-      if (inputCanonToOriginals.has(c)) found.add(c);
-    }
-    return;
-  }
-
-  if (Array.isArray(obj)) {
-    for (const v of obj) walk(v, parentKey);
-    return;
-  }
-
-  if (typeof obj === "object") {
-    for (const [k, v] of Object.entries(obj)) {
-      walk(v, k);
-    }
-  }
-}
-
-const browser = await chromium.launch({ headless: true });
-const page = await browser.newPage();
-
-page.on("response", async (res) => {
-  try {
-    // Some sites label JSON as text/plain; try parsing anyway for likely API URLs
-    const url = res.url();
-    const ct = (res.headers()["content-type"] || "").toLowerCase();
-    const looksJson = ct.includes("json") || url.includes("/api") || url.includes("particip") || url.includes("list");
-
-    if (!looksJson) return;
+  while (next) {
+    const res = await fetch(next, {
+      headers: {
+        "Accept": "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": REFERER,
+        "User-Agent": "Mozilla/5.0"
+      }
+    });
 
     const text = await res.text();
-    if (!text || text.length < 2) return;
 
-    // Try JSON parse
-    let json;
+    // Try JSON parse; if it isn't JSON, print a snippet and fail clearly
+    let data;
     try {
-      json = JSON.parse(text);
-    } catch {
-      return;
+      data = JSON.parse(text);
+    } catch (e) {
+      console.log("Non-JSON response snippet (first 300 chars):");
+      console.log(text.slice(0, 300));
+      throw new Error(`API did not return JSON (status ${res.status}).`);
     }
 
-    walk(json, "");
-  } catch {
-    // ignore
+    if (Array.isArray(data)) {
+      all.push(...data);
+      next = null;
+    } else {
+      if (Array.isArray(data.results)) all.push(...data.results);
+      next = data.next || null;
+    }
   }
-});
 
-await page.goto(URL, { waitUntil: "domcontentloaded" });
-await page.waitForTimeout(5000);
-
-// Scroll a bit to trigger lazy loading if any
-for (let i = 0; i < 10; i++) {
-  await page.mouse.wheel(0, 2500);
-  await page.waitForTimeout(1200);
+  return all;
 }
 
-await browser.close();
+// Walk each record and only collect strings that match your input names
+function collectMatchesFromRecord(rec, matches) {
+  const stack = [rec];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (cur == null) continue;
 
-// Write results (using original input order)
-const lines = ["name,found"];
-for (const n of inputNames) {
-  const yes = found.has(canon(n)) ? "YES" : "NO";
-  lines.push(`${n},${yes}`);
+    if (typeof cur === "string") {
+      const c = norm(cur);
+      if (inputSet.has(c)) matches.add(c);
+      continue;
+    }
+    if (Array.isArray(cur)) {
+      for (const v of cur) stack.push(v);
+      continue;
+    }
+    if (typeof cur === "object") {
+      for (const v of Object.values(cur)) stack.push(v);
+    }
+  }
 }
-fs.writeFileSync("results.csv", lines.join("\n"), "utf8");
 
-console.log(`Input names: ${inputNames.length}`);
-console.log(`Matched (canonical) names found: ${found.size}`);
+const records = await fetchAll(API_URL);
+
+const matches = new Set();
+for (const r of records) collectMatchesFromRecord(r, matches);
+
+console.log(`API records fetched: ${records.length}`);
+console.log(`Matched names found: ${matches.size}`);
+
+// Output CSV preserving your original formatting per line
+const out = ["name,found"];
+for (const line of rawLines) {
+  const c = norm(line);
+  if (!c) continue;
+  out.push(`${line.trim()},${matches.has(c) ? "YES" : "NO"}`);
+}
+fs.writeFileSync("results.csv", out.join("\n"), "utf8");
